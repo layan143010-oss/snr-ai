@@ -1,299 +1,352 @@
-from flask import Flask, render_template_string, request, jsonify
-import re
+from flask import Flask, request, jsonify
+import re, datetime, uuid
+from difflib import SequenceMatcher, get_close_matches
 
 app = Flask(__name__)
 
-APP_NAME = "SNR Emergency AI"
+# =========================
+# EMERGENCY CORE DATA
+# =========================
 
-EMERGENCY_NUMBERS = {
+NUMBERS = {
     "ambulance": "997",
     "fire": "998",
-    "police": "999",
-    "general": "997"
+    "police": "999"
 }
 
-# -----------------------------
-# Language detection
-# -----------------------------
-ARABIC_CHARS = re.compile(r'[\u0600-\u06FF]')
+INCIDENT_LOGS = []
 
-def detect_language(text):
-    return "ar" if ARABIC_CHARS.search(text) else "en"
-
-# -----------------------------
-# Emergency database (EN + AR)
-# -----------------------------
 EMERGENCIES = {
     "fire": {
-        "keywords": ["fire", "smoke", "burning", "flames", "gas leak", "حريق", "دخان", "احتراق"],
-        "advice_en": "Evacuate immediately. Stay low under smoke.",
-        "advice_ar": "غادر المكان فوراً. ابقَ منخفضاً تحت الدخان.",
-        "extra_en": "Do not use elevators.",
-        "extra_ar": "لا تستخدم المصاعد.",
-        "number": "fire"
+        "keywords": ["fire", "smoke", "burning", "explosion", "gas leak"],
+        "level": 5,
+        "actions": "Evacuate immediately. Do not inhale smoke. Call fire department."
     },
-
-    "heart_attack": {
-        "keywords": ["heart attack", "chest pain", "tight chest", "نوبة قلبية", "ألم صدر"],
-        "advice_en": "Call emergency services immediately.",
-        "advice_ar": "اتصل بالإسعاف فوراً.",
-        "extra_en": "Keep person calm.",
-        "extra_ar": "حافظ على هدوء المصاب.",
-        "number": "ambulance"
+    "medical": {
+        "keywords": ["heart", "chest pain", "unconscious", "bleeding", "not breathing", "injury"],
+        "level": 5,
+        "actions": "Call ambulance immediately. Keep patient stable and still."
     },
-
-    "bleeding": {
-        "keywords": ["bleeding", "blood", "cut", "wound", "نزيف", "جرح", "دم"],
-        "advice_en": "Apply strong pressure to stop bleeding.",
-        "advice_ar": "اضغط بقوة لإيقاف النزيف.",
-        "extra_en": "Do not remove cloth.",
-        "extra_ar": "لا تنزع القماش.",
-        "number": "ambulance"
+    "accident": {
+        "keywords": ["car crash", "accident", "collision", "hit", "bike crash"],
+        "level": 4,
+        "actions": "Check injuries. Move to safe area if possible."
+    },
+    "danger": {
+        "keywords": ["attack", "robbery", "danger", "threat", "weapon"],
+        "level": 5,
+        "actions": "Call police immediately. Move to safe location."
     }
 }
 
-user_location = {}
+# =========================
+# AI ENGINE
+# =========================
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def normalize(text):
-    return text.lower()
+def normalize(t):
+    t = t.lower()
+    return re.sub(r"[^\w\s']", " ", t)
 
-def detect_emergency(text):
-    best = None
-    best_score = 0
+def score(text, keywords):
+    s = 0
+    for k in keywords:
+        if k in text:
+            s += 4
+        if SequenceMatcher(None, text, k).ratio() > 0.75:
+            s += 2
+    return s
 
-    for cat, data in EMERGENCIES.items():
-        score = sum(1 for k in data["keywords"] if k in text.lower())
-        if score > best_score:
-            best = cat
-            best_score = score
+def detect(text):
+    results = []
+    for name, data in EMERGENCIES.items():
+        sc = score(text, data["keywords"])
+        if sc >= 3:
+            results.append((name, sc, data))
+    return sorted(results, key=lambda x: x[1], reverse=True)
 
-    return best
+def risk(text):
+    high = ["dying", "not breathing", "unconscious", "fire", "blood"]
+    return "HIGH" if any(w in text for w in high) else "MEDIUM"
 
-# -----------------------------
-# Core response engine
-# -----------------------------
-def get_response(text):
-    lang = detect_language(text)
-    cat = detect_emergency(text)
+def engine(msg, lat=None, lon=None):
 
-    maps_link = None
-    if user_location:
-        lat = user_location.get("lat")
-        lon = user_location.get("lon")
-        maps_link = f"https://www.google.com/maps?q={lat},{lon}"
+    text = normalize(msg)
+    matches = detect(text)
+    r = risk(text)
 
-    if cat:
-        data = EMERGENCIES[cat]
+    if matches:
+        name, sc, data = matches[0]
+
+        level = data["level"]
+        action = data["actions"]
+
+        if r == "HIGH" or level == 5:
+            action = "🚨 CRITICAL: " + action
+
+        incident = {
+            "id": str(uuid.uuid4())[:8],
+            "type": name,
+            "risk": r,
+            "score": sc,
+            "time": str(datetime.datetime.utcnow()),
+            "lat": lat,
+            "lon": lon
+        }
+
+        INCIDENT_LOGS.append(incident)
 
         return {
-            "type": "emergency",
-            "category": cat,
-            "advice": data["advice_ar"] if lang == "ar" else data["advice_en"],
-            "extra": data["extra_ar"] if lang == "ar" else data["extra_en"],
-            "number": EMERGENCY_NUMBERS[data["number"]],
-            "lang": lang,
-            "maps": maps_link
+            "status": "emergency",
+            "type": name,
+            "risk": r,
+            "actions": action,
+            "incident": incident
         }
 
     return {
-        "type": "unknown",
-        "message": "لم يتم تحديد الحالة بوضوح" if lang == "ar"
-                   else "Emergency not clearly identified.",
-        "number": EMERGENCY_NUMBERS["general"],
-        "maps": maps_link,
-        "lang": lang
+        "status": "unknown",
+        "risk": r,
+        "actions": "Stay calm. If danger exists, call emergency services."
     }
 
-# -----------------------------
-# UI (SNR DESIGN)
-# -----------------------------
+# =========================
+# SCI-FI UI
+# =========================
+
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>SNR Emergency AI</title>
-
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="manifest" href="/manifest.json">
+
+<title>SNR Emergency Command Center</title>
 
 <style>
-body {
-    margin:0;
-    font-family:Arial;
-    background:linear-gradient(135deg,#0b1f3a,#020b18);
-    color:white;
+
+body{
+margin:0;
+font-family:Arial;
+background:#000;
+color:#fff;
 }
 
-.container {
-    max-width:800px;
-    margin:30px auto;
-    background:white;
-    color:#0b1f3a;
-    padding:20px;
-    border-radius:15px;
+.header{
+padding:20px;
+text-align:center;
+background:linear-gradient(90deg,#120000,#000,#001);
+border-bottom:2px solid red;
+box-shadow:0 0 30px red;
 }
 
-h1 {text-align:center;color:#0077b6;}
-
-input {
-    width:100%;
-    padding:15px;
-    border-radius:10px;
-    border:1px solid #ccc;
+.header h1{
+margin:0;
+font-size:28px;
+letter-spacing:2px;
 }
 
-.btn {
-    padding:12px;
-    margin-top:10px;
-    border:none;
-    border-radius:10px;
-    cursor:pointer;
+.container{
+display:grid;
+grid-template-columns:2fr 1fr;
+gap:15px;
+padding:20px;
 }
 
-.blue {background:#0077b6;color:white;}
-.cyan {background:#90e0ef;color:#0b1f3a;}
-
-.call {
-    display:inline-block;
-    margin:5px;
-    padding:10px;
-    background:#00b4d8;
-    color:white;
-    border-radius:8px;
-    text-decoration:none;
+.panel{
+background:#0a0a0a;
+border:1px solid #222;
+border-radius:12px;
+padding:15px;
+box-shadow:0 0 20px rgba(255,0,0,0.2);
 }
 
-.card {
-    margin-top:20px;
-    padding:15px;
-    background:#e0f7ff;
-    border-radius:10px;
+input{
+width:100%;
+padding:12px;
+background:#000;
+border:1px solid #333;
+color:#fff;
+border-radius:8px;
+margin-bottom:10px;
 }
+
+button{
+width:100%;
+padding:12px;
+margin:5px 0;
+border:none;
+border-radius:8px;
+cursor:pointer;
+font-weight:bold;
+}
+
+.ai{background:red;color:white;}
+.gps{background:#222;color:white;}
+.call{background:#330000;color:white;}
+.report{background:#111;color:white;}
+
+.box{
+margin-top:10px;
+padding:10px;
+background:#000;
+border:1px solid #222;
+min-height:120px;
+white-space:pre-wrap;
+}
+
+.emergency{
+color:red;
+font-weight:bold;
+}
+
+.small{
+font-size:12px;
+opacity:0.6;
+}
+
 </style>
+
 </head>
 
 <body>
 
+<div class="header">
+<h1>🚨 SNR EMERGENCY COMMAND CENTER</h1>
+<div class="small">AI DISPATCH SYSTEM • LIVE MONITORING</div>
+</div>
+
 <div class="container">
 
-<h1>🚨 SNR Emergency AI</h1>
+<!-- MAIN -->
+<div class="panel">
 
-<form method="POST">
-    <input name="message" placeholder="Describe emergency..." required>
+<h3>⚡ AI Emergency Input</h3>
 
-    <button type="button" class="btn cyan" onclick="startVoice()">🎤 Voice</button>
-    <button type="button" class="btn cyan" onclick="getGPS()">📍 GPS</button>
-    <button type="submit" class="btn blue">Analyze</button>
-</form>
+<input id="msg" placeholder="Describe emergency...">
 
-<div>
-<a class="call" href="tel:997">Ambulance</a>
-<a class="call" href="tel:998">Fire</a>
-<a class="call" href="tel:999">Police</a>
-</div>
+<button class="ai" onclick="ask()">ANALYZE EMERGENCY</button>
+<button class="gps" onclick="gps()">AUTO GPS LOCK</button>
+<button class="call" onclick="sos()">SEND SOS REPORT</button>
 
-{% if response %}
-<div class="card">
-
-{% if response.type == "emergency" %}
-<h3>{{ response.category }}</h3>
-<p><b>Advice:</b> {{ response.advice }}</p>
-<p>{{ response.extra }}</p>
-
-<a class="call" href="tel:{{ response.number }}">CALL {{ response.number }}</a>
-
-{% else %}
-<p>{{ response.message }}</p>
-{% endif %}
-
-{% if response.maps %}
-<br><br>
-<a class="call" href="{{ response.maps }}" target="_blank">
-📍 Open Location in Maps
-</a>
-{% endif %}
+<div class="box" id="out">System ready...</div>
 
 </div>
-{% endif %}
+
+<!-- SIDE -->
+<div class="panel">
+
+<h3>📞 Emergency Calls</h3>
+
+<button class="call" onclick="window.location.href='tel:997'">Ambulance 997</button>
+<button class="call" onclick="window.location.href='tel:998'">Fire 998</button>
+<button class="call" onclick="window.location.href='tel:999'">Police 999</button>
+
+<h3 style="margin-top:15px;">📊 Reports</h3>
+
+<div class="box" id="reports">No incidents yet</div>
+
+</div>
 
 </div>
 
 <script>
-function startVoice(){
-    const r = new (window.SpeechRecognition||window.webkitSpeechRecognition)();
-    r.lang="en-US";
-    r.start();
-    r.onresult=e=>{
-        document.querySelector("input").value=e.results[0][0].transcript;
-    }
+
+let lat=null, lon=null;
+
+function ask(){
+
+let msg=document.getElementById("msg").value;
+
+fetch("/chat",{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({message:msg,lat,lon})
+})
+.then(r=>r.json())
+.then(d=>{
+
+if(d.status==="emergency"){
+document.getElementById("out").innerText =
+"TYPE: "+d.type+"\nRISK: "+d.risk+"\n\n"+d.actions;
+}else{
+document.getElementById("out").innerText=d.actions;
 }
 
-function getGPS(){
-    navigator.geolocation.getCurrentPosition(pos=>{
-        fetch("/location",{
-            method:"POST",
-            headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({
-                lat:pos.coords.latitude,
-                lon:pos.coords.longitude
-            })
-        });
-    });
-}
-</script>
+loadReports();
 
-<script>
-if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js');
+});
+
 }
+
+function gps(){
+navigator.geolocation.getCurrentPosition(p=>{
+lat=p.coords.latitude;
+lon=p.coords.longitude;
+alert("GPS LOCKED: "+lat+", "+lon);
+});
+}
+
+function sos(){
+fetch("/sos",{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({lat,lon})
+});
+alert("SOS SENT");
+}
+
+function loadReports(){
+fetch("/reports")
+.then(r=>r.json())
+.then(d=>{
+document.getElementById("reports").innerText =
+JSON.stringify(d,null,2);
+});
+}
+
+setInterval(loadReports,3000);
+
 </script>
 
 </body>
 </html>
 """
 
-# -----------------------------
-# Routes
-# -----------------------------
-@app.route("/", methods=["GET","POST"])
+# =========================
+# ROUTES
+# =========================
+
+@app.route("/")
 def home():
-    res = None
-    if request.method == "POST":
-        msg = request.form.get("message")
-        res = get_response(normalize(msg))
-    return render_template_string(HTML, response=res)
+    return HTML
 
-@app.route("/location", methods=["POST"])
-def location():
-    global user_location
-    user_location = request.get_json()
-    return jsonify({"ok": True})
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    msg = data.get("message","")
+    lat = data.get("lat")
+    lon = data.get("lon")
 
-@app.route("/manifest.json")
-def manifest():
-    return {
-        "name": "SNR Emergency AI",
-        "short_name": "SNR",
-        "start_url": "/",
-        "display": "standalone",
-        "theme_color": "#0077b6",
-        "background_color": "#0b1f3a"
-    }
+    return jsonify(engine(msg,lat,lon))
 
-@app.route("/sw.js")
-def sw():
-    return """
-self.addEventListener('install', e=>{
-  e.waitUntil(caches.open('v1').then(c=>c.addAll(['/'])));
-});
-self.addEventListener('fetch', e=>{
-  e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)));
-});
-""", 200, {"Content-Type": "text/javascript"}
+@app.route("/sos", methods=["POST"])
+def sos():
+    data = request.json
+    INCIDENT_LOGS.append({
+        "type":"SOS",
+        "time":str(datetime.datetime.utcnow()),
+        "lat":data.get("lat"),
+        "lon":data.get("lon")
+    })
+    return jsonify({"status":"logged"})
 
-# -----------------------------
+@app.route("/reports")
+def reports():
+    return jsonify(INCIDENT_LOGS[-10:])
+
+# =========================
+# RUN
+# =========================
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000)
